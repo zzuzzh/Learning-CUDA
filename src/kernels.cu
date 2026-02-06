@@ -135,6 +135,10 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 constexpr int TILE_Q = 16;
 constexpr int TILE_K = 16;
 
+/**
+ * FlashAttention kernel for float
+ * warp-tiled GEMM style
+ */
 __global__ void flashAttentionKernelFloat(
     const float* __restrict__ Q,
     const float* __restrict__ K,
@@ -163,6 +167,7 @@ __global__ void flashAttentionKernelFloat(
 
     int q_rows_in_tile = min(TILE_Q, total_q_rows - q_tile_start);
 
+    // Loop over Q rows in this tile
     for (int q_row = 0; q_row < q_rows_in_tile; ++q_row)
     {
         int q_idx_global = q_tile_start + q_row;
@@ -172,31 +177,32 @@ __global__ void flashAttentionKernelFloat(
         int qh = rem % query_heads;
         int kv_group = qh / head_ratio;
 
-        // Initialize output accumulator
-        float acc_out[64] = {0}; // assume head_dim <= 64
+        // Allocate per-thread accumulator for head_dim
+        float* acc_out = new float[head_dim];
+        for (int d = 0; d < head_dim; ++d) acc_out[d] = 0.0f;
 
         float max_score = -1e20f;
-        float scores[TILE_K] = {0};
+        float* scores = new float[TILE_K];
 
+        // Loop over K tiles
         for (int k_tile_start = 0; k_tile_start < src_seq_len; k_tile_start += TILE_K)
         {
             int k_rows_in_tile = min(TILE_K, src_seq_len - k_tile_start);
 
-            // Load K and V tiles
+            // Load K and V tile into shared memory
             for (int i = lane; i < k_rows_in_tile * head_dim; i += 32)
             {
                 int row = i / head_dim;
                 int col = i % head_dim;
-                int k_idx = b * src_seq_len * kv_heads * head_dim
-                            + (k_tile_start + row) * kv_heads * head_dim
-                            + kv_group * head_dim + col;
-                int v_idx = k_idx;
-                K_tile[row * head_dim + col] = K[k_idx];
-                V_tile[row * head_dim + col] = V[v_idx];
+                int idx = b * src_seq_len * kv_heads * head_dim
+                          + (k_tile_start + row) * kv_heads * head_dim
+                          + kv_group * head_dim + col;
+                K_tile[row * head_dim + col] = K[idx];
+                V_tile[row * head_dim + col] = V[idx];
             }
             __syncwarp();
 
-            // Compute dot products
+            // Compute dot(Q, K) for this tile
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
             {
                 int k_idx_global = k_tile_start + k_inner;
@@ -223,7 +229,7 @@ __global__ void flashAttentionKernelFloat(
             }
             __syncwarp();
 
-            // Softmax
+            // Compute softmax sum
             float sum_exp = 0.0f;
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
                 if (lane % 32 == 0)
@@ -232,6 +238,7 @@ __global__ void flashAttentionKernelFloat(
             sum_exp = __shfl_sync(0xffffffff, sum_exp, 0);
             __syncwarp();
 
+            // Weighted sum over V
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
             {
                 float weight = expf(scores[k_inner] - max_score) / sum_exp;
@@ -239,7 +246,7 @@ __global__ void flashAttentionKernelFloat(
                     acc_out[d] += weight * V_tile[k_inner * head_dim + d];
             }
             __syncwarp();
-        } // k_tile loop
+        }
 
         // Write output
         for (int d = lane; d < head_dim; d += 32)
@@ -249,7 +256,10 @@ __global__ void flashAttentionKernelFloat(
                         + qh * head_dim + d;
             O[o_idx] = acc_out[d];
         }
-    } // q_row loop
+
+        delete[] acc_out;
+        delete[] scores;
+    }
 }
 
 
@@ -288,6 +298,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     size_t v_size = h_v.size() * sizeof(float);
     size_t o_size = batch_size * target_seq_len * query_heads * head_dim * sizeof(float);
 
+    h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
+
     cudaMalloc(&d_q, q_size);
     cudaMalloc(&d_k, k_size);
     cudaMalloc(&d_v, v_size);
@@ -311,7 +323,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         is_causal
     );
 
-    h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
     cudaMemcpy(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost);
 
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
