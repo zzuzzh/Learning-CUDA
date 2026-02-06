@@ -118,10 +118,38 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 
 
-#define WARP_SIZE 32
-#define BLOCK_SIZE 128 // 4 Warps per block
 
-// --- Warp 级归约辅助函数 ---
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <iostream>
+#include <cfloat>
+
+#define WARP_SIZE 32
+#define BLOCK_SIZE 128
+
+// --- 安全搬运函数：支持向量化与标量回退 --- D取值有1,2,4,8,16,32,64
+template<typename T>
+__device__ __forceinline__ void robust_load(const T* src, float* dst, int D, int lane_id) {
+    // 检查地址是否满足 float4 对齐 (16字节)
+    uintptr_t addr = reinterpret_cast<uintptr_t>(src);
+    bool can_vectorize = (D % 4 == 0) && ((addr & 0xF) == 0);
+
+    if (can_vectorize) {
+        const float4* src_v4 = reinterpret_cast<const float4*>(src);
+        float4* dst_v4 = reinterpret_cast<float4*>(dst);
+        for (int d4 = lane_id; d4 < D / 4; d4 += WARP_SIZE) {
+            dst_v4[d4] = src_v4[d4];
+        }
+    } else {
+        // 标量回退：处理 D=1, 2 或非对齐地址
+        for (int d = lane_id; d < D; d += WARP_SIZE) {
+            dst[d] = (float)src[d];
+        }
+    }
+}
+
+// --- Warp 归约 ---
 __device__ __forceinline__ float warpReduceMax(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
         val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
@@ -134,27 +162,8 @@ __device__ __forceinline__ float warpReduceSum(float val) {
     return val;
 }
 
-// --- 安全搬运函数：支持向量化与标量回退 ---
-template<typename T>
-__device__ __forceinline__ void safe_load_to_smem(const T* src, float* dst, int D, int lane_id) {
-    // 如果 D 是 4 的倍数且是 float/half 类型，尝试向量化
-    if (D % 4 == 0) {
-        const float4* src_v4 = reinterpret_cast<const float4*>(src);
-        float4* dst_v4 = reinterpret_cast<float4*>(dst);
-        for (int d4 = lane_id; d4 < D / 4; d4 += WARP_SIZE) {
-            float4 tmp = src_v4[d4];
-            dst_v4[d4] = tmp;
-        }
-    } else {
-        // 标量回退 (处理 D=1, 2, 3 等情况)
-        for (int d = lane_id; d < D; d += WARP_SIZE) {
-            dst[d] = (float)src[d];
-        }
-    }
-}
-
 // -----------------------------------------------------------------------------
-// Flash Attention 向量化安全 Kernel
+// Flash Attention  Kernel
 // -----------------------------------------------------------------------------
 template <typename T>
 __global__ void flash_attn_kernel(
@@ -162,74 +171,74 @@ __global__ void flash_attn_kernel(
     int B, int N_target, int N_src, int H_q, int H_kv, int D,
     float scale, bool is_causal
 ) {
-    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int warp_idx = threadIdx.x / WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
-    int warp_global_id = blockIdx.y * num_warps + warp_in_block;
     int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_global_id = blockIdx.y * num_warps + warp_idx;
 
     int batch_idx = blockIdx.x / H_q;
     int head_q_idx = blockIdx.x % H_q;
     int head_kv_idx = head_q_idx / (H_q / H_kv);
 
-    // 共享内存布局
     extern __shared__ float s_mem[];
-    float* s_Q_base = s_mem; 
+    float* s_Q = s_mem; 
     float* s_K = s_mem + num_warps * D;
     float* s_V = s_K + WARP_SIZE * D;
 
-    // 1. 加载 Q (必须确保即便无效的 Warp 也参与同步)
+    // 1. 加载 Q 到共享内存
     if (warp_global_id < N_target) {
         const T* q_ptr = Q + ((batch_idx * N_target + warp_global_id) * H_q + head_q_idx) * D;
-        safe_load_to_smem(q_ptr, s_Q_base + warp_in_block * D, D, lane_id);
+        robust_load(q_ptr, s_Q + warp_idx * D, D, lane_id);
     }
-    __syncthreads(); // 关键同步
+    __syncthreads();
 
-    // 如果 Warp 超出范围，停止计算但不退出，以保持同步一致性 (或者在此之后不再有同步)
     if (warp_global_id >= N_target) return;
 
-    // 寄存器初始化 (支持最大 D=128 的向量化存储)
-    float acc_o[128]; 
-    #pragma unroll
-    for (int i = 0; i < 128; ++i) acc_o[i] = 0.0f;
-    
+    // 寄存器状态量
     float row_m = -FLT_MAX;
     float row_l = 0.0f;
+    float acc_o[64]; // 支持最大 D=64
+    #pragma unroll
+    for (int i = 0; i < 64; ++i) acc_o[i] = 0.0f;
 
-    // 2. 外层分块循环
+    // 外层循环遍历 KV
     for (int j_start = 0; j_start < N_src; j_start += WARP_SIZE) {
         int j_src = j_start + lane_id;
-        
-        // 协作加载 K, V
+
+        // 2. 协作加载 K, V
         if (j_src < N_src) {
             const T* k_ptr = K + ((batch_idx * N_src + j_src) * H_kv + head_kv_idx) * D;
             const T* v_ptr = V + ((batch_idx * N_src + j_src) * H_kv + head_kv_idx) * D;
-            safe_load_to_smem(k_ptr, s_K + lane_id * D, D, 0); // 这里简写，由于是单线程负责一行
-            safe_load_to_smem(v_ptr, s_V + lane_id * D, D, 0);
+            // K/V 的 robust_load 需要针对单行加载
+            for (int d = 0; d < D; ++d) {
+                s_K[lane_id * D + d] = (float)k_ptr[d];
+                s_V[lane_id * D + d] = (float)v_ptr[d];
+            }
         }
         __syncthreads();
 
-        // 3. 计算分数
+        // 3. 计算本地分数 S
         float local_s = -FLT_MAX;
         if (j_src < N_src && (!is_causal || j_src <= warp_global_id)) {
-            local_s = 0.0f;
+            float sum_val = 0.0f;
             for (int d = 0; d < D; ++d) {
-                local_s += s_Q_base[warp_in_block * D + d] * s_K[lane_id * D + d];
+                sum_val += s_Q[warp_idx * D + d] * s_K[lane_id * D + d];
             }
-            local_s *= scale;
+            local_s = sum_val * scale;
         }
 
-        // 4. Softmax 统计更新
+        // 4. Online Softmax 更新
         float max_val = warpReduceMax(local_s);
         float new_m = fmaxf(row_m, max_val);
         float p_scale = expf(row_m - new_m);
         float exp_s = (local_s == -FLT_MAX) ? 0.0f : expf(local_s - new_m);
-        float new_l = row_l * p_scale + warpReduceSum(exp_s);
+        float sum_exp = warpReduceSum(exp_s);
+        float new_l = row_l * p_scale + sum_exp;
 
-        // 5. 更新 O (向量化展开)
-        #pragma unroll
+        // 5. 更新输出 O
+        // 注意：这里必须严格限制到 D
         for (int d = 0; d < D; ++d) {
             acc_o[d] *= p_scale;
-            // 每一个线程通过 shuffle 拿当前块内所有线程的 exp_s
             for (int k = 0; k < WARP_SIZE; ++k) {
                 float e = __shfl_sync(0xffffffff, exp_s, k);
                 acc_o[d] += e * s_V[k * D + d];
@@ -241,9 +250,10 @@ __global__ void flash_attn_kernel(
         __syncthreads();
     }
 
-    // 6. 写回
-    for (int d = 0; d < D; ++d) {
-        O[((batch_idx * N_target + warp_global_id) * H_q + head_q_idx) * D + d] = (T)(acc_o[d] / row_l);
+    // 6. 归一化写回
+    T* o_ptr = O + ((batch_idx * N_target + warp_global_id) * H_q + head_q_idx) * D;
+    for (int d = lane_id; d < D; d += WARP_SIZE) {
+        o_ptr[d] = (T)(acc_o[d] / row_l);
     }
 }
 
