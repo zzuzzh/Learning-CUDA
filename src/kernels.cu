@@ -122,16 +122,25 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 
 
-constexpr int TILE_Q = 16;
-constexpr int TILE_K = 16;
 
-/**
- * Device-safe min
- */
+
+
+
+
+
+
+
+
+
+
+constexpr int TILE_Q = 16;   // Q block 行数
+constexpr int TILE_K = 16;   // K block 行数
+
 __device__ __forceinline__ int dev_min(int a, int b) { return (a < b) ? a : b; }
 
 /**
- * FlashAttention kernel for float, warp-tiled, GQA + causal
+ * Warp-tiled FlashAttention kernel (float only)
+ * Supports GQA + causal masking
  */
 __global__ void flashAttentionKernelFloat(
     const float* __restrict__ Q,
@@ -158,7 +167,6 @@ __global__ void flashAttentionKernelFloat(
     float* V_tile = smem + TILE_K * head_dim;
 
     int head_ratio = query_heads / kv_heads;
-
     int q_rows_in_tile = dev_min(TILE_Q, total_q_rows - q_tile_start);
 
     for (int q_row = 0; q_row < q_rows_in_tile; ++q_row)
@@ -170,18 +178,19 @@ __global__ void flashAttentionKernelFloat(
         int qh = rem % query_heads;
         int kv_group = dev_min(qh / head_ratio, kv_heads - 1);
 
-        // Allocate accumulator on stack
-        float max_score = -1e20f;
-        float* acc_out = new float[head_dim];
-        for (int d = 0; d < head_dim; ++d) acc_out[d] = 0.0f;
+        // Stack array for accumulator
+        // 每个 thread 处理 head_dim 分块
+        float acc_val[32]; // 每次最多循环 32 个元素
+        for (int i = 0; i < 32; ++i) acc_val[i] = 0.0f;
 
+        float max_score = -1e20f;
         float scores[TILE_K];
 
         for (int k_tile_start = 0; k_tile_start < src_seq_len; k_tile_start += TILE_K)
         {
             int k_rows_in_tile = dev_min(TILE_K, src_seq_len - k_tile_start);
 
-            // Load K and V tiles into shared memory
+            // Load K/V tile into shared memory
             for (int i = lane; i < k_rows_in_tile * head_dim; i += 32)
             {
                 int row = i / head_dim;
@@ -196,7 +205,7 @@ __global__ void flashAttentionKernelFloat(
             }
             __syncwarp();
 
-            // Compute dot product Q·K
+            // Compute Q·K dot
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
             {
                 int k_idx_global = k_tile_start + k_inner;
@@ -224,7 +233,7 @@ __global__ void flashAttentionKernelFloat(
             }
             __syncwarp();
 
-            // Compute softmax sum
+            // Compute softmax denominator
             float sum_exp = 0.0f;
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
                 if (lane % 32 == 0)
@@ -239,7 +248,7 @@ __global__ void flashAttentionKernelFloat(
                 float weight = expf(scores[k_inner] - max_score) / sum_exp;
                 for (int d = lane; d < head_dim; d += 32)
                     if (d < head_dim)
-                        acc_out[d] += weight * V_tile[k_inner * head_dim + d];
+                        acc_val[d % 32] += weight * V_tile[k_inner * head_dim + d];
             }
             __syncwarp();
         }
@@ -251,20 +260,10 @@ __global__ void flashAttentionKernelFloat(
                         + t * query_heads * head_dim
                         + qh * head_dim + d;
             if (d < head_dim)
-                O[o_idx] = acc_out[d];
+                O[o_idx] = acc_val[d % 32];
         }
-
-        delete[] acc_out;
     }
 }
-
-
-
-
-
-
-
-
 
 
 
@@ -305,7 +304,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {    
   // TODO: Implement the flash attention function
-   float *d_q, *d_k, *d_v, *d_o;
+    float *d_q, *d_k, *d_v, *d_o;
     h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
 
     cudaMalloc(&d_q, h_q.size() * sizeof(float));
@@ -333,7 +332,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     cudaMemcpy(h_o.data(), d_o, h_o.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
-    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o); 
 }
 
 
