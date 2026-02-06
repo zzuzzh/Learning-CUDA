@@ -315,8 +315,10 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         // 在调用前增加此属性设置
     cudaFuncSetAttribute(flash_attn_warp_tiled_kernel<T>, 
                      cudaFuncAttributeMaxDynamicSharedMemorySize, 
-                     smem_size);
-                     
+                     (int)smem_size);                 
+
+    printf("Launch Config: B=%d, N_T=%d, H_Q=%d, D=%d, smem=%zu\n", 
+       batch_size, target_seq_len, query_heads, head_dim, smem_size);
     // 在 Kernel 启动前打印
     if (target_seq_len > 60000) {
       printf("Warning: target_seq_len (%d) is very large, grid.y will be %d\n", 
