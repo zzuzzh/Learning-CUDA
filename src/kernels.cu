@@ -135,7 +135,7 @@ __device__ __forceinline__ void robust_load(const T* src, float* dst, int D, int
     unsigned long long addr = (unsigned long long)src;
     bool can_vectorize = (D % 4 == 0) && ((addr & 0xF) == 0);
 
-    if (can_vectorize) {
+    if (false) { //can_vectorize
         const float4* src_v4 = reinterpret_cast<const float4*>(src);
         float4* dst_v4 = reinterpret_cast<float4*>(dst);
         for (int d4 = lane_id; d4 < D / 4; d4 += WARP_SIZE) {
