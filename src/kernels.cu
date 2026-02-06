@@ -132,7 +132,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template<typename T>
 __device__ __forceinline__ void robust_load(const T* src, float* dst, int D, int lane_id) {
     // 检查地址是否满足 float4 对齐 (16字节)
-    uintptr_t addr = reinterpret_cast<uintptr_t>(src);
+    unsigned long long addr = (unsigned long long)src;
     bool can_vectorize = (D % 4 == 0) && ((addr & 0xF) == 0);
 
     if (can_vectorize) {
