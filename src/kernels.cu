@@ -131,30 +131,15 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 
 
-template <typename T>
-__device__ inline float to_float(T x) { return static_cast<float>(x); }
-
-template <>
-__device__ inline float to_float<half>(half x) { return __half2float(x); }
-
-template <typename T>
-__device__ inline T from_float(float x) { return static_cast<T>(x); }
-
-template <>
-__device__ inline half from_float<half>(float x) { return __float2half(x); }
 
 constexpr int TILE_Q = 16;
 constexpr int TILE_K = 16;
 
-/**
- * @brief FlashAttention kernel (warp-tiled GEMM style)
- */
-template <typename T>
-__global__ void flashAttentionKernel(
-    const T* __restrict__ Q,
-    const T* __restrict__ K,
-    const T* __restrict__ V,
-    T* __restrict__ O,
+__global__ void flashAttentionKernelFloat(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
     int batch_size,
     int tgt_seq_len,
     int src_seq_len,
@@ -174,76 +159,56 @@ __global__ void flashAttentionKernel(
     float* K_tile = smem;
     float* V_tile = smem + TILE_K * head_dim;
 
-    // Determine warp's batch, target token, query head
-    int warp_idx = q_tile_start;
-    int b = warp_idx / (tgt_seq_len * query_heads);
-    int rem = warp_idx % (tgt_seq_len * query_heads);
-    int t = rem / query_heads;
-    int qh = rem % query_heads;
-
-    // GQA mapping
     int head_ratio = query_heads / kv_heads;
-    int kv_group = qh / head_ratio;
 
-    // Number of Q rows in this warp tile (handle tail)
-    int q_rows_in_tile = min(TILE_Q, tgt_seq_len * query_heads * batch_size - q_tile_start);
+    int q_rows_in_tile = min(TILE_Q, total_q_rows - q_tile_start);
 
-    for (int k_tile_start = 0; k_tile_start < src_seq_len; k_tile_start += TILE_K)
+    for (int q_row = 0; q_row < q_rows_in_tile; ++q_row)
     {
-        int k_rows_in_tile = min(TILE_K, src_seq_len - k_tile_start);
+        int q_idx_global = q_tile_start + q_row;
+        int b = q_idx_global / (tgt_seq_len * query_heads);
+        int rem = q_idx_global % (tgt_seq_len * query_heads);
+        int t = rem / query_heads;
+        int qh = rem % query_heads;
+        int kv_group = qh / head_ratio;
 
-        // Load K tile
-        for (int i = lane; i < k_rows_in_tile * head_dim; i += 32)
+        // Initialize output accumulator
+        float acc_out[64] = {0}; // assume head_dim <= 64
+
+        float max_score = -1e20f;
+        float scores[TILE_K] = {0};
+
+        for (int k_tile_start = 0; k_tile_start < src_seq_len; k_tile_start += TILE_K)
         {
-            int row = i / head_dim;
-            int col = i % head_dim;
-            int k_idx = b * src_seq_len * kv_heads * head_dim
-                        + (k_tile_start + row) * kv_heads * head_dim
-                        + kv_group * head_dim + col;
-            K_tile[row * head_dim + col] = to_float(K[k_idx]);
-        }
+            int k_rows_in_tile = min(TILE_K, src_seq_len - k_tile_start);
 
-        // Load V tile
-        for (int i = lane; i < k_rows_in_tile * head_dim; i += 32)
-        {
-            int row = i / head_dim;
-            int col = i % head_dim;
-            int v_idx = b * src_seq_len * kv_heads * head_dim
-                        + (k_tile_start + row) * kv_heads * head_dim
-                        + kv_group * head_dim + col;
-            V_tile[row * head_dim + col] = to_float(V[v_idx]);
-        }
+            // Load K and V tiles
+            for (int i = lane; i < k_rows_in_tile * head_dim; i += 32)
+            {
+                int row = i / head_dim;
+                int col = i % head_dim;
+                int k_idx = b * src_seq_len * kv_heads * head_dim
+                            + (k_tile_start + row) * kv_heads * head_dim
+                            + kv_group * head_dim + col;
+                int v_idx = k_idx;
+                K_tile[row * head_dim + col] = K[k_idx];
+                V_tile[row * head_dim + col] = V[v_idx];
+            }
+            __syncwarp();
 
-        __syncwarp();
-
-        // Loop over Q rows in tile
-        for (int q_row = 0; q_row < q_rows_in_tile; ++q_row)
-        {
-            int q_idx_global = q_tile_start + q_row;
-            int b_local = q_idx_global / (tgt_seq_len * query_heads);
-            int rem_local = q_idx_global % (tgt_seq_len * query_heads);
-            int t_local = rem_local / query_heads;
-            int qh_local = rem_local % query_heads;
-
-            float acc_out[64]; // max head_dim <= 64
-            for (int d = 0; d < head_dim; ++d) acc_out[d] = 0.0f;
-
-            float max_score = -1e20f;
-            float scores[TILE_K];
-
-            // Compute dot(Q,K) for this tile
+            // Compute dot products
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
             {
                 int k_idx_global = k_tile_start + k_inner;
-                if (is_causal && k_idx_global > t_local) { scores[k_inner] = -1e20f; continue; }
+                if (is_causal && k_idx_global > t) { scores[k_inner] = -1e20f; continue; }
 
                 float dot = 0.0f;
                 for (int d = lane; d < head_dim; d += 32)
                 {
-                    int q_idx = b_local * tgt_seq_len * query_heads * head_dim
-                                + t_local * query_heads * head_dim
-                                + qh_local * head_dim + d;
-                    dot += to_float(Q[q_idx]) * K_tile[k_inner * head_dim + d];
+                    int q_idx = b * tgt_seq_len * query_heads * head_dim
+                                + t * query_heads * head_dim
+                                + qh * head_dim + d;
+                    dot += Q[q_idx] * K_tile[k_inner * head_dim + d];
                 }
 
                 // warp reduction
@@ -253,45 +218,38 @@ __global__ void flashAttentionKernel(
                 if (lane % 32 == 0)
                 {
                     scores[k_inner] = dot;
-                    if (dot > max_score) max_score = dot;
+                    max_score = fmaxf(max_score, dot);
                 }
             }
             __syncwarp();
 
-            // softmax sum
+            // Softmax
             float sum_exp = 0.0f;
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
-            {
                 if (lane % 32 == 0)
                     sum_exp += expf(scores[k_inner] - max_score);
-            }
 
-            // broadcast sum_exp to warp
             sum_exp = __shfl_sync(0xffffffff, sum_exp, 0);
             __syncwarp();
 
-            // weighted sum over V
             for (int k_inner = 0; k_inner < k_rows_in_tile; ++k_inner)
             {
                 float weight = expf(scores[k_inner] - max_score) / sum_exp;
                 for (int d = lane; d < head_dim; d += 32)
-                {
                     acc_out[d] += weight * V_tile[k_inner * head_dim + d];
-                }
             }
+            __syncwarp();
+        } // k_tile loop
 
-            // Write output
-            for (int d = lane; d < head_dim; d += 32)
-            {
-                int o_idx = b_local * tgt_seq_len * query_heads * head_dim
-                            + t_local * query_heads * head_dim
-                            + qh_local * head_dim + d;
-                O[o_idx] = from_float<T>(acc_out[d]);
-            }
+        // Write output
+        for (int d = lane; d < head_dim; d += 32)
+        {
+            int o_idx = b * tgt_seq_len * query_heads * head_dim
+                        + t * query_heads * head_dim
+                        + qh * head_dim + d;
+            O[o_idx] = acc_out[d];
         }
-
-        __syncwarp();
-    }
+    } // q_row loop
 }
 
 
@@ -324,12 +282,11 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {    
   // TODO: Implement the flash attention function
-   // Allocate device memory
-    T *d_q, *d_k, *d_v, *d_o;
-    size_t q_size = h_q.size() * sizeof(T);
-    size_t k_size = h_k.size() * sizeof(T);
-    size_t v_size = h_v.size() * sizeof(T);
-    size_t o_size = batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
+    float *d_q, *d_k, *d_v, *d_o;
+    size_t q_size = h_q.size() * sizeof(float);
+    size_t k_size = h_k.size() * sizeof(float);
+    size_t v_size = h_v.size() * sizeof(float);
+    size_t o_size = batch_size * target_seq_len * query_heads * head_dim * sizeof(float);
 
     cudaMalloc(&d_q, q_size);
     cudaMalloc(&d_k, k_size);
@@ -340,28 +297,25 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     cudaMemcpy(d_k, h_k.data(), k_size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice);
 
-    // Launch kernel
     int total_q_rows = batch_size * target_seq_len * query_heads;
     int num_warps = (total_q_rows + TILE_Q - 1) / TILE_Q;
     int warps_per_block = 4;
     int threads_per_block = 32 * warps_per_block;
     int grid_size = (num_warps + warps_per_block - 1) / warps_per_block;
+    size_t shared_bytes = 2 * TILE_K * head_dim * sizeof(float);
 
-    size_t shared_bytes = 2 * TILE_K * head_dim * sizeof(float); // K + V
-
-    flashAttentionKernel<T><<<grid_size, threads_per_block, shared_bytes>>>(
+    flashAttentionKernelFloat<<<grid_size, threads_per_block, shared_bytes>>>(
         d_q, d_k, d_v, d_o,
         batch_size, target_seq_len, src_seq_len,
         query_heads, kv_heads, head_dim,
         is_causal
     );
 
+    h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
     cudaMemcpy(h_o.data(), d_o, o_size, cudaMemcpyDeviceToHost);
 
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
-
 }
-
 
 
 
