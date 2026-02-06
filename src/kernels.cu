@@ -307,7 +307,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
       scale, is_causal
   );
 
-  //cudaDeviceSynchronize();
+  cudaDeviceSynchronize();
   cudaMemcpy(h_o.data(), d_o, q_sz, cudaMemcpyDeviceToHost);
 
   cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
