@@ -139,9 +139,9 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 #define WARP_SIZE 32
 #define BLOCK_SIZE 128 // 4 Warps per block
 
-// -----------------------------------------------------------------------------
-// Warp-level Reduction 辅助函数
-// -----------------------------------------------------------------------------
+
+
+// --- Warp 级归约辅助函数 ---
 __device__ __forceinline__ float warpReduceMax(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
         val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
@@ -155,110 +155,113 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 }
 
 // -----------------------------------------------------------------------------
-// CUDA Kernel
+// Flash Attention 核心 Kernel
 // -----------------------------------------------------------------------------
 template <typename T>
-__global__ void flash_attn_warp_tiled_kernel(
+__global__ void flash_attn_optimized_kernel(
     const T* Q, const T* K, const T* V, T* O,
     int B, int N_target, int N_src, int H_q, int H_kv, int D,
     float scale, bool is_causal
 ) {
-    // 每个 Warp 负责一行 (Query Row)
-    int warp_id = (blockIdx.y * blockDim.x + threadIdx.x) / WARP_SIZE;
+    // 基础索引计算
+    int warp_id_in_block = threadIdx.x / WARP_SIZE;
+    int num_warps_per_block = blockDim.x / WARP_SIZE;
+    int warp_global_id = blockIdx.y * num_warps_per_block + warp_id_in_block;
     int lane_id = threadIdx.x % WARP_SIZE;
-    
+
     int batch_idx = blockIdx.x / H_q;
     int head_q_idx = blockIdx.x % H_q;
-    int head_kv_idx = head_q_idx / (H_q / H_kv); 
-    
-    // 如果 warp_id 超出了目标序列长度，直接返回
-    if (warp_id >= N_target) return;
+    int head_kv_idx = head_q_idx / (H_q / H_kv); // GQA 支持
 
-    // 共享内存：用于存放当前 KV 块
-    // 实际优化中 Q 也可放入 Shared，此处重点展示 KV Tiling
-    extern __shared__ float s_mem[]; 
-    float* s_K = s_mem;                    // Size: Bc * D
-    float* s_V = s_mem + (WARP_SIZE * D);   // Size: Bc * D
+    if (warp_global_id >= N_target) return;
 
+    // 共享内存布局: s_Q (当前 Block 的所有 Warp 分占) | s_K (一个 Warp 大小) | s_V (一个 Warp 大小)
+    extern __shared__ float s_mem[];
+    float* s_Q_base = s_mem; 
+    float* s_K = s_mem + num_warps_per_block * D;
+    float* s_V = s_K + WARP_SIZE * D;
+
+    // 1. 加载当前 Warp 负责的一行 Q 到 Shared Memory
+    // 每个线程协作加载 D 维中的部分
+    for (int d = lane_id; d < D; d += WARP_SIZE) {
+        s_Q_base[warp_id_in_block * D + d] = (float)Q[((batch_idx * N_target + warp_global_id) * H_q + head_q_idx) * D + d];
+    }
+    __syncthreads();
+
+    // 寄存器统计量与累加器
     float row_m = -FLT_MAX;
     float row_l = 0.0f;
     
-    // 每个线程负责输出 D 维向量中的一部分 (Warp-tiled GEMM 基础)
-    float acc_o[128]; // 假设 D <= 128
-    for (int d = 0; d < D; ++d) acc_o[d] = 0.0f;
+    // 通用索引：每个线程分担 D 维中的 MAX_D_PER_THREAD 个元素
+    const int MAX_D_PER_THREAD = 8; 
+    float acc_o[MAX_D_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < MAX_D_PER_THREAD; ++i) acc_o[i] = 0.0f;
 
-    // 循环遍历 KV 的 Sequence dimension (Bc 为分块大小)
+    // 外层分块循环 (Tiling KV rows)
     int Bc = WARP_SIZE; 
     for (int j_start = 0; j_start < N_src; j_start += Bc) {
         
-        // 1. 加载 K, V 到 Shared Memory (协作加载)
-        if (j_start + lane_id < N_src) {
+        // 2. 协作加载 K, V 块到 Shared Memory
+        int j_src = j_start + lane_id;
+        if (j_src < N_src) {
             for (int d = 0; d < D; ++d) {
-                s_K[lane_id * D + d] = (float)K[((batch_idx * N_src + j_start + lane_id) * H_kv + head_kv_idx) * D + d];
-                s_V[lane_id * D + d] = (float)V[((batch_idx * N_src + j_start + lane_id) * H_kv + head_kv_idx) * D + d];
+                s_K[lane_id * D + d] = (float)K[((batch_idx * N_src + j_src) * H_kv + head_kv_idx) * D + d];
+                s_V[lane_id * D + d] = (float)V[((batch_idx * N_src + j_src) * H_kv + head_kv_idx) * D + d];
             }
         }
         __syncthreads();
 
-        // 2. 计算当前 Warp 负责的行与 Shared Memory 中 KV 块的点积
-        // 这里每个线程计算该行与 Bc 个 Key 中的一个的点积
-        float score = -FLT_MAX;
-        int current_kv_idx = j_start + lane_id;
-        
-        if (current_kv_idx < N_src && (!is_causal || current_kv_idx <= warp_id)) {
-            score = 0.0f;
+        // 3. 计算 S = QK^T 
+        // 这里的 Q 已经在 Shared Memory 中
+        float local_s = -FLT_MAX;
+        if (j_src < N_src && (!is_causal || j_src <= warp_global_id)) {
+            local_s = 0.0f;
             for (int d = 0; d < D; ++d) {
-                float q_val = (float)Q[((batch_idx * N_target + warp_id) * H_q + head_q_idx) * D + d];
-                score += q_val * s_K[lane_id * D + d];
+                local_s += s_Q_base[warp_id_in_block * D + d] * s_K[lane_id * D + d];
             }
-            score *= scale;
+            local_s *= scale;
         }
 
-        // 3. Online Softmax (Warp 内部归约)
-        float max_in_block = warpReduceMax(score);
+        // 4. Online Softmax 归约 (Warp 级)
+        float max_in_block = warpReduceMax(local_s);
         float new_m = fmaxf(row_m, max_in_block);
         
-        float exp_score = (score == -FLT_MAX) ? 0.0f : expf(score - new_m);
-        float row_l_updated = row_l * expf(row_m - new_m) + warpReduceSum(exp_score);
-
-        // 4. 更新输出累加器 (V 也是按 lane 加载的)
         float p_scale = expf(row_m - new_m);
-        for (int d = 0; d < D; ++d) {
-            // 先调整旧的累加值
-            acc_o[d] *= p_scale;
-            // 加上新的贡献：exp_score 对应的是当前 lane_id (即当前块内的某个 j)
-            // 需要通过 Shuffle 让所有线程都能获取每个 exp_score 并累加对应的 V
-            for (int k = 0; k < WARP_SIZE; ++k) {
-                float e = __shfl_sync(0xffffffff, exp_score, k);
-                float v_val = s_V[k * D + d];
-                acc_o[d] += e * v_val;
+        float exp_score = (local_s == -FLT_MAX) ? 0.0f : expf(local_s - new_m);
+        float sum_exp = warpReduceSum(exp_score);
+        float new_l = row_l * p_scale + sum_exp;
+
+        // 5. 更新输出累加器 O = O * p_scale + P * V
+        // 每个线程更新自己负责的 d 维度
+        #pragma unroll
+        for (int i = 0; i < MAX_D_PER_THREAD; ++i) {
+            int d_idx = lane_id + i * WARP_SIZE;
+            if (d_idx < D) {
+                acc_o[i] *= p_scale;
+                // 利用 Shuffle 获取当前块内每个线程对应的 exp_score 并累加对应的 V
+                for (int k = 0; k < WARP_SIZE; ++k) {
+                    float e = __shfl_sync(0xffffffff, exp_score, k);
+                    acc_o[i] += e * s_V[k * D + d_idx];
+                }
             }
         }
 
         row_m = new_m;
-        row_l = row_l_updated;
+        row_l = new_l;
         __syncthreads();
     }
 
-    // 5. 最终归一化并写回全局内存
-    // 只有 lane_0 包含完整的 row_l，但此处所有线程都需要 row_l 归一化自己负责的 d
-    float final_l = __shfl_sync(0xffffffff, row_l, 0); 
-    for (int d = 0; d < D; ++d) {
-        O[((batch_idx * N_target + warp_id) * H_q + head_q_idx) * D + d] = (T)(acc_o[d] / final_l);
+    // 6. 最终归一化并写回
+    float final_l = __shfl_sync(0xffffffff, row_l, 0);
+    #pragma unroll
+    for (int i = 0; i < MAX_D_PER_THREAD; ++i) {
+        int d_idx = lane_id + i * WARP_SIZE;
+        if (d_idx < D) {
+            O[((batch_idx * N_target + warp_global_id) * H_q + head_q_idx) * D + d_idx] = (T)(acc_o[i] / final_l);
+        }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -288,57 +291,51 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {    
   // TODO: Implement the flash attention function
-   T *d_q, *d_k, *d_v, *d_o;
-    size_t q_size = h_q.size() * sizeof(T);
-    size_t kv_size = h_k.size() * sizeof(T);
-    
-    cudaMalloc(&d_q, q_size);
-    cudaMalloc(&d_k, kv_size);
-    cudaMalloc(&d_v, kv_size);
-    cudaMalloc(&d_o, q_size);
+  T *d_q, *d_k, *d_v, *d_o;
+    size_t q_sz = h_q.size() * sizeof(T);
+    size_t kv_sz = h_k.size() * sizeof(T);
 
-    cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k.data(), kv_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v.data(), kv_size, cudaMemcpyHostToDevice);
+    cudaMalloc(&d_q, q_sz);
+    cudaMalloc(&d_k, kv_sz);
+    cudaMalloc(&d_v, kv_sz);
+    cudaMalloc(&d_o, q_sz);
+
+    cudaMemcpy(d_q, h_q.data(), q_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), kv_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), kv_sz, cudaMemcpyHostToDevice);
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    // 计算共享内存大小: Bc * D * 2 (K and V) * 4 bytes
-    int Bc = WARP_SIZE;
-    size_t smem_size = Bc * head_dim * 2 * sizeof(float);
+    // 共享内存计算: s_Q (每 block 4行) + s_K (1行) + s_V (1行)
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
+    size_t smem_size = (num_warps * head_dim + WARP_SIZE * head_dim * 2) * sizeof(float);
 
-    // 一个 Block 4 个 Warps，Grid 根据目标序列长度分配
-    dim3 block(BLOCK_SIZE); 
-    dim3 grid(batch_size * query_heads, (target_seq_len + (BLOCK_SIZE/WARP_SIZE) - 1) / (BLOCK_SIZE/WARP_SIZE));
+    // 解锁 A100 共享内存限制,会否超参数
+    //cudaFuncSetAttribute(flash_attn_optimized_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size);
 
-
-        // 在调用前增加此属性设置
-    cudaFuncSetAttribute(flash_attn_warp_tiled_kernel<T>, 
-                     cudaFuncAttributeMaxDynamicSharedMemorySize, 
-                     (int)smem_size);                 
-
+    
+    // 在 Kernel 启动前打印
     printf("Launch Config: B=%d, N_T=%d, H_Q=%d, D=%d, smem=%zu\n", 
        batch_size, target_seq_len, query_heads, head_dim, smem_size);
-    // 在 Kernel 启动前打印
-    if (target_seq_len > 60000) {
-      printf("Warning: target_seq_len (%d) is very large, grid.y will be %d\n", 
-            target_seq_len, (target_seq_len + 3) / 4);
-    }
-    size_t current_smem = Bc * head_dim * 2 * sizeof(float);
-    if (current_smem > 48000) {
-      printf("Warning: smem_size (%zu) exceeds 48KB default limit\n", current_smem);
-    }
+    
+    
 
+    dim3 grid(batch_size * query_heads, (target_seq_len + num_warps - 1) / num_warps);
+    dim3 block(BLOCK_SIZE);
 
-    flash_attn_warp_tiled_kernel<T><<<grid, block, smem_size>>>(
+    flash_attn_optimized_kernel<T><<<grid, block, smem_size>>>(
         d_q, d_k, d_v, d_o,
         batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim,
         scale, is_causal
     );
 
-    cudaMemcpy(h_o.data(), d_o, q_size, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_o.data(), d_o, q_sz, cudaMemcpyDeviceToHost);
 
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
+    
+
+
 }
 
 
