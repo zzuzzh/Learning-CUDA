@@ -128,26 +128,20 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 #define WARP_SIZE 32
 #define BLOCK_SIZE 128
 
-// --- 安全搬运函数：支持向量化与标量回退 --- D取值有1,2,4,8,16,32,64
+// --- 未来支持向量化与标量回退 --- D取值有1,2,4,8,16,32,64
 template<typename T>
 __device__ __forceinline__ void robust_load(const T* src, float* dst, int D, int lane_id) {
-    // 检查地址是否满足 float4 对齐 (16字节)
-    unsigned long long addr = (unsigned long long)src;
-    bool can_vectorize = (D % 4 == 0) && ((addr & 0xF) == 0);
 
     if (false) { //can_vectorize
-        const float4* src_v4 = reinterpret_cast<const float4*>(src);
-        float4* dst_v4 = reinterpret_cast<float4*>(dst);
-        for (int d4 = lane_id; d4 < D / 4; d4 += WARP_SIZE) {
-            dst_v4[d4] = src_v4[d4];
-        }
+        
+        
     } else {
         // 标量回退：处理 D=1, 2 或非对齐地址
         for (int d = lane_id; d < D; d += WARP_SIZE) {
             dst[d] = (float)src[d];
         }
     }
-}
+  }
 
 // --- Warp 归约 ---
 __device__ __forceinline__ float warpReduceMax(float val) {
