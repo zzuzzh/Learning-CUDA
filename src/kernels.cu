@@ -128,16 +128,11 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 
 
-
-
-
-
 constexpr int TILE_Q = 16;
 constexpr int TILE_K = 16;
 
 /**
- * FlashAttention kernel for float
- * warp-tiled GEMM style
+ * FlashAttention kernel for float, warp-tiled, GQA + causal
  */
 __global__ void flashAttentionKernelFloat(
     const float* __restrict__ Q,
@@ -165,7 +160,10 @@ __global__ void flashAttentionKernelFloat(
 
     int head_ratio = query_heads / kv_heads;
 
-    int q_rows_in_tile = min(TILE_Q, total_q_rows - q_tile_start);
+    
+    int q_rows_in_tile = (TILE_Q < (total_q_rows - q_tile_start)) ? TILE_Q : (total_q_rows - q_tile_start);
+
+
 
     // Loop over Q rows in this tile
     for (int q_row = 0; q_row < q_rows_in_tile; ++q_row)
@@ -175,25 +173,29 @@ __global__ void flashAttentionKernelFloat(
         int rem = q_idx_global % (tgt_seq_len * query_heads);
         int t = rem / query_heads;
         int qh = rem % query_heads;
-        int kv_group = qh / head_ratio;
+        int kv_group = ((qh / head_ratio) < kv_heads) ? (qh / head_ratio) : (kv_heads - 1);
 
-        // Allocate per-thread accumulator for head_dim
-        float* acc_out = new float[head_dim];
+        // Allocate per-thread accumulator on stack
+        // 如果 head_dim > 64，则循环处理
+        const int MAX_HEAD_DIM = 128; // 每线程循环块
+        float acc_out[MAX_HEAD_DIM];
         for (int d = 0; d < head_dim; ++d) acc_out[d] = 0.0f;
 
         float max_score = -1e20f;
-        float* scores = new float[TILE_K];
+        float scores[TILE_K];
 
         // Loop over K tiles
         for (int k_tile_start = 0; k_tile_start < src_seq_len; k_tile_start += TILE_K)
         {
-            int k_rows_in_tile = min(TILE_K, src_seq_len - k_tile_start);
+            
+            int k_rows_in_tile = (TILE_K < (src_seq_len - k_tile_start)) ? TILE_K : (src_seq_len - k_tile_start);
 
             // Load K and V tile into shared memory
             for (int i = lane; i < k_rows_in_tile * head_dim; i += 32)
             {
                 int row = i / head_dim;
                 int col = i % head_dim;
+                if (col >= head_dim) continue;
                 int idx = b * src_seq_len * kv_heads * head_dim
                           + (k_tile_start + row) * kv_heads * head_dim
                           + kv_group * head_dim + col;
@@ -214,7 +216,7 @@ __global__ void flashAttentionKernelFloat(
                     int q_idx = b * tgt_seq_len * query_heads * head_dim
                                 + t * query_heads * head_dim
                                 + qh * head_dim + d;
-                    dot += Q[q_idx] * K_tile[k_inner * head_dim + d];
+                    if (d < head_dim) dot += Q[q_idx] * K_tile[k_inner * head_dim + d];
                 }
 
                 // warp reduction
@@ -243,7 +245,8 @@ __global__ void flashAttentionKernelFloat(
             {
                 float weight = expf(scores[k_inner] - max_score) / sum_exp;
                 for (int d = lane; d < head_dim; d += 32)
-                    acc_out[d] += weight * V_tile[k_inner * head_dim + d];
+                    if (d < head_dim)
+                        acc_out[d] += weight * V_tile[k_inner * head_dim + d];
             }
             __syncwarp();
         }
@@ -254,13 +257,20 @@ __global__ void flashAttentionKernelFloat(
             int o_idx = b * tgt_seq_len * query_heads * head_dim
                         + t * query_heads * head_dim
                         + qh * head_dim + d;
-            O[o_idx] = acc_out[d];
+            if (d < head_dim)
+                O[o_idx] = acc_out[d];
         }
-
-        delete[] acc_out;
-        delete[] scores;
     }
 }
+
+
+
+
+
+
+
+
+
 
 
 
