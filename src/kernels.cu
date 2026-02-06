@@ -294,8 +294,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   dim3 grid(batch_size * query_heads, (target_seq_len + num_warps - 1) / num_warps);
   dim3 block(BLOCK_SIZE);
 
-  // 解锁 A100 共享内存限制,会否超参数
-  //cudaFuncSetAttribute(flash_attn_optimized_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size);
+  
 
     
   // 在 Kernel 启动前打印
@@ -308,7 +307,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
       scale, is_causal
   );
 
-  cudaDeviceSynchronize();
+  //cudaDeviceSynchronize();
   cudaMemcpy(h_o.data(), d_o, q_sz, cudaMemcpyDeviceToHost);
 
   cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
