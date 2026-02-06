@@ -307,6 +307,11 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     int Bc = WARP_SIZE;
     size_t smem_size = Bc * head_dim * 2 * sizeof(float);
 
+    // 在调用前增加此属性设置
+    cudaFuncSetAttribute(flash_attn_warp_tiled_kernel<T>, 
+                     cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                     smem_size);
+
     // 一个 Block 4 个 Warps，Grid 根据目标序列长度分配
     dim3 block(BLOCK_SIZE); 
     dim3 grid(batch_size * query_heads, (target_seq_len + (BLOCK_SIZE/WARP_SIZE) - 1) / (BLOCK_SIZE/WARP_SIZE));
