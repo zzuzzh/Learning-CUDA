@@ -120,10 +120,6 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 
 
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <iostream>
-#include <cfloat>
 
 #define WARP_SIZE 32
 #define BLOCK_SIZE 128
@@ -250,31 +246,6 @@ __global__ void flash_attn_kernel(
         o_ptr[d] = (T)(acc_o[d] / row_l);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
-
-
-
-
 
 
 
