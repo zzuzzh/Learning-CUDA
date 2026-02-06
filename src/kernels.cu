@@ -307,14 +307,26 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     int Bc = WARP_SIZE;
     size_t smem_size = Bc * head_dim * 2 * sizeof(float);
 
-    // 在调用前增加此属性设置
-    cudaFuncSetAttribute(flash_attn_warp_tiled_kernel<T>, 
-                     cudaFuncAttributeMaxDynamicSharedMemorySize, 
-                     smem_size);
-
     // 一个 Block 4 个 Warps，Grid 根据目标序列长度分配
     dim3 block(BLOCK_SIZE); 
     dim3 grid(batch_size * query_heads, (target_seq_len + (BLOCK_SIZE/WARP_SIZE) - 1) / (BLOCK_SIZE/WARP_SIZE));
+
+
+        // 在调用前增加此属性设置
+    cudaFuncSetAttribute(flash_attn_warp_tiled_kernel<T>, 
+                     cudaFuncAttributeMaxDynamicSharedMemorySize, 
+                     smem_size);
+                     
+    // 在 Kernel 启动前打印
+    if (target_seq_len > 60000) {
+      printf("Warning: target_seq_len (%d) is very large, grid.y will be %d\n", 
+            target_seq_len, (target_seq_len + 3) / 4);
+    }
+    size_t current_smem = Bc * head_dim * 2 * sizeof(float);
+    if (current_smem > 48000) {
+      printf("Warning: smem_size (%zu) exceeds 48KB default limit\n", current_smem);
+    }
+
 
     flash_attn_warp_tiled_kernel<T><<<grid, block, smem_size>>>(
         d_q, d_k, d_v, d_o,
